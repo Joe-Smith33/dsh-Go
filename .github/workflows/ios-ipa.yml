@@ -1,0 +1,78 @@
+# Builds an unsigned .ipa for a real iPhone on a macOS runner.
+#
+# This is a companion to .github/workflows/ios-compile.yml: that one only proves
+# the code compiles (simulator + device, no codesign) and never produces an
+# installable file. This one packages the device build into Payload/Runner.app
+# inside a zip, so a sideloading tool (iloader, Sideloadly) can sign and install
+# it from any Windows machine.
+#
+# Nothing here uses secrets or an Apple account: the artifact is unsigned on
+# purpose. Signing happens locally against the user's own free Apple ID.
+name: iOS ipa (unsigned)
+
+on:
+  # Manual only. A `workflow_dispatch` run can be started from any branch, which is
+  # what we need here: the iOS code lives on feat/ios-foundation, and GitHub only
+  # offers the "Run workflow" button for workflows present on the default branch.
+  # No push trigger on purpose - a push to main would find no iOS code to build.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      FLUTTER_VERSION: 3.47.7
+      FLUTTER_SHA256: dd9da574c3168460550117eb0e8dd0313ae934fabf64a82a6d557fff5fd1422e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show the toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphone
+
+      - name: Install Flutter
+        run: |
+          archive="flutter_macos_arm64_${FLUTTER_VERSION}-stable.zip"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://storage.googleapis.com/flutter_infra_release/releases/stable/macos/$archive"
+          echo "$FLUTTER_SHA256  $RUNNER_TEMP/$archive" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/$archive" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve dependencies
+        run: |
+          flutter --version
+          python3 app/tool/l10n_merge.py --no-gen
+          cd app
+          flutter pub get --enforce-lockfile
+          flutter gen-l10n
+
+      # Remote-only build: tooling/ios/prepare-engine.sh is deliberately NOT run,
+      # so no bundled Node/proot engine is embedded and the app is a client that
+      # connects to a DSH host (dsh web on a PC, SSH host, or DSH Remote).
+      - name: Build for a device, unsigned
+        working-directory: app
+        run: bash ../tooling/ios/build.sh --release --no-codesign
+
+      - name: Package .ipa
+        run: bash tooling/ios/package-ipa.sh "$GITHUB_WORKSPACE/dist"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dsh-go-ipa-unsigned
+          path: dist/*.ipa
+          if-no-files-found: error
+          retention-days: 30
