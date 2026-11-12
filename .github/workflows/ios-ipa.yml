@@ -1,27 +1,33 @@
 # Builds an unsigned .ipa for a real iPhone on a macOS runner.
 #
-# This is a companion to .github/workflows/ios-compile.yml: that one only proves
-# the code compiles (simulator + device, no codesign) and never produces an
-# installable file. This one packages the device build into Payload/Runner.app
-# inside a zip, so a sideloading tool (iloader, Sideloadly) can sign and install
-# it from any Windows machine.
+# Why this file can live in a throwaway fork: every step below checks out the
+# upstream repository by name, so this workflow works from ANY fork (or even a
+# bare repo with just this one file on main) without needing the iOS branch to
+# be visible in the fork. Only the "Run workflow" button requires this file to
+# be on the default branch, which is what we do.
 #
 # Nothing here uses secrets or an Apple account: the artifact is unsigned on
-# purpose. Signing happens locally against the user's own free Apple ID.
+# purpose. Signing happens on the user's own machine (iloader / Sideloadly).
+#
+# Deliberate choice: tooling/ios/prepare-engine.sh is NOT run, so the bundled
+# Node host (DshNodeHost.framework) and the Linux guest payload are absent and
+# the app is a remote-only client. See HANDOFF.md, section "一·半".
 name: iOS ipa (unsigned)
 
 on:
-  # Manual only. A `workflow_dispatch` run can be started from any branch, which is
-  # what we need here: the iOS code lives on feat/ios-foundation, and GitHub only
-  # offers the "Run workflow" button for workflows present on the default branch.
-  # No push trigger on purpose - a push to main would find no iOS code to build.
   workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream branch or tag to build
+        required: false
+        default: feat/ios-foundation
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ios-ipa-${{ github.ref }}
+  group: ios-ipa-${{ github.ref }}-${{ inputs.upstream_ref }}
   cancel-in-progress: true
 
 jobs:
@@ -32,13 +38,18 @@ jobs:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       FLUTTER_VERSION: 3.47.7
       FLUTTER_SHA256: dd9da574c3168460550117eb0e8dd0313ae934fabf64a82a6d557fff5fd1422e
+      UPSTREAM_REF: ${{ inputs.upstream_ref }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the upstream iOS branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ccch1mneyyy/dsh-Go
+          ref: ${{ inputs.upstream_ref }}
           persist-credentials: false
 
       - name: Show the toolchain
         run: |
+          echo "building $GITHUB_REPOSITORY@$UPSTREAM_REF ($(git rev-parse --short HEAD))"
           sw_vers
           xcodebuild -version
           xcodebuild -showsdks | grep -i iphone
@@ -60,15 +71,58 @@ jobs:
           flutter pub get --enforce-lockfile
           flutter gen-l10n
 
-      # Remote-only build: tooling/ios/prepare-engine.sh is deliberately NOT run,
-      # so no bundled Node/proot engine is embedded and the app is a client that
-      # connects to a DSH host (dsh web on a PC, SSH host, or DSH Remote).
       - name: Build for a device, unsigned
         working-directory: app
         run: bash ../tooling/ios/build.sh --release --no-codesign
 
+      # Packaging is inlined on purpose: no second file has to exist on the
+      # upstream branch, and the ipa layout is visible right here.
       - name: Package .ipa
-        run: bash tooling/ios/package-ipa.sh "$GITHUB_WORKSPACE/dist"
+        run: |
+          set -euo pipefail
+          APP="$GITHUB_WORKSPACE/app/build/ios/iphoneos/Runner.app"
+          OUT="$GITHUB_WORKSPACE/dist"
+          [ -d "$APP" ] || { echo "::error::no device build at $APP"; exit 1; }
+          case "$(file -b "$APP/Runner")" in
+            *Mach-O*arm64*) ;;
+            *) echo "::error::$APP/Runner is not an arm64 Mach-O (simulator build?)"; exit 1 ;;
+          esac
+          mkdir -p "$OUT"
+
+          package() {
+            name="$1"; strip="$2"; work="$(mktemp -d)"
+            mkdir -p "$work/Payload"
+            cp -R "$APP" "$work/Payload/Runner.app"
+            if [ "$strip" = yes ]; then
+              rm -rf "$work/Payload/Runner.app/PlugIns"
+            fi
+            rm -f "$OUT/$name"
+            ( cd "$work" && zip -qry "$OUT/$name" Payload )
+            rm -rf "$work"
+            printf '%-30s %10s bytes  sha256=%s\n' "$name" \
+              "$(wc -c <"$OUT/$name" | tr -d ' ')" \
+              "$(shasum -a 256 "$OUT/$name" | cut -d' ' -f1)"
+          }
+
+          package dsh-go-unsigned.ipa no
+          package dsh-go-unsigned-noshare.ipa yes
+
+          {
+            echo '### ipa'
+            echo
+            echo '| file | bytes | sha256 |'
+            echo '|---|---|---|'
+            for f in "$OUT"/*.ipa; do
+              echo "| $(basename "$f") | $(wc -c <"$f" | tr -d ' ') | $(shasum -a 256 "$f" | cut -d' ' -f1) |"
+            done
+            echo
+            echo '### remote-only check'
+            echo
+            for item in Frameworks/DshNodeHost.framework PhoneSelfRunner Frameworks/App.framework; do
+              if [ -e "$APP/$item" ]; then echo "- present: $item"; else echo "- absent: $item"; fi
+            done
+            echo "- Runner.app: $(du -sm "$APP" | cut -f1) MB"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
