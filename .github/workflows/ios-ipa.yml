@@ -86,6 +86,21 @@ jobs:
         if: ${{ inputs.with_engine }}
         run: bash tooling/ios/prepare-engine.sh
 
+      # tooling/ios/ish/build.py needs clang + ld.lld + meson + ninja + patch; the
+      # macOS image only ships clang, so the guest addon build fails without these.
+      # Same recipe and pins as upstream's ios-compile.yml "engine" job.
+      - name: Install the iSH build tools
+        if: ${{ inputs.with_engine }}
+        run: |
+          brew install llvm lld
+          python3 -m venv "$RUNNER_TEMP/ish-tools"
+          "$RUNNER_TEMP/ish-tools/bin/pip" install --quiet meson==1.7.2 ninja==1.11.1.4
+          echo "$RUNNER_TEMP/ish-tools/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/ish-tools/bin/meson" --version
+          "$(brew --prefix lld)/bin/ld.lld" --version
+
       - name: Resolve dependencies
         run: |
           flutter --version
