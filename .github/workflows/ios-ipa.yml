@@ -96,7 +96,30 @@ jobs:
 
       - name: Build for a device, unsigned
         working-directory: app
-        run: bash ../tooling/ios/build.sh --release --no-codesign
+        run: |
+          set -o pipefail
+          if bash ../tooling/ios/build.sh --release --no-codesign --verbose > "$RUNNER_TEMP/build.log" 2>&1; then
+            tail -n 15 "$RUNNER_TEMP/build.log"
+          else
+            echo "::error::the device build failed; the full log is the dsh-go-build-log artifact"
+            echo "::group::tail of the build log"
+            tail -n 100 "$RUNNER_TEMP/build.log" || true
+            echo "::endgroup::"
+            echo "::group::lines that look like the cause"
+            grep -inE 'error:|requires a development team|CodeSign|provisioning|PhaseScriptExecution|BUILD FAILED|Undefined symbol' \
+              "$RUNNER_TEMP/build.log" | head -40 || true
+            echo "::endgroup::"
+            exit 1
+          fi
+
+      - name: Upload the build log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dsh-go-build-log
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: warn
+          retention-days: 7
 
       # Packaging is inlined on purpose: no second file has to exist on the
       # upstream branch, and the ipa layout is visible right here.
