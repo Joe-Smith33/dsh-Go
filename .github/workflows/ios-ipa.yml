@@ -9,9 +9,18 @@
 # Nothing here uses secrets or an Apple account: the artifact is unsigned on
 # purpose. Signing happens on the user's own machine (iloader / Sideloadly).
 #
-# Deliberate choice: tooling/ios/prepare-engine.sh is NOT run, so the bundled
-# Node host (DshNodeHost.framework) and the Linux guest payload are absent and
-# the app is a remote-only client. See HANDOFF.md, section "一·半".
+# Two builds, one switch — input `with_engine`:
+#   false (default) → remote-only client. tooling/ios/prepare-engine.sh is not
+#                     run, so DshNodeHost.framework / NodeMobile are absent and
+#                     the ipa stays small. This is the build that is known to
+#                     work on device.
+#   true            → on-device engine. prepare-engine.sh composes NodeMobile
+#                     24.22.1 + the runtime archive into app/ios/Engine/, and
+#                     the Xcode phase embed-engine.sh compiles the three native
+#                     frameworks and embeds them (~90 MB of Node, ~160 MB of
+#                     runtime on first launch). --jitless, so no JIT entitlement
+#                     is needed. EXPERIMENTAL: upstream says this path was still
+#                     unverified on a real iPhone as of 2026-11-06.
 name: iOS ipa (unsigned)
 
 on:
@@ -22,23 +31,29 @@ on:
         required: false
         default: feat/ios-foundation
         type: string
+      with_engine:
+        description: Embed the on-device engine (NodeMobile, experimental, much bigger ipa)
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: ios-ipa-${{ github.ref }}-${{ inputs.upstream_ref }}
+  group: ios-ipa-${{ github.ref }}-${{ inputs.upstream_ref }}-${{ inputs.with_engine }}
   cancel-in-progress: true
 
 jobs:
   ipa:
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       FLUTTER_VERSION: 3.47.7
       FLUTTER_SHA256: dd9da574c3168460550117eb0e8dd0313ae934fabf64a82a6d557fff5fd1422e
       UPSTREAM_REF: ${{ inputs.upstream_ref }}
+      WITH_ENGINE: ${{ inputs.with_engine }}
     steps:
       - name: Check out the upstream iOS branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,9 +65,11 @@ jobs:
       - name: Show the toolchain
         run: |
           echo "building $GITHUB_REPOSITORY@$UPSTREAM_REF ($(git rev-parse --short HEAD))"
+          echo "with_engine=$WITH_ENGINE"
           sw_vers
           xcodebuild -version
           xcodebuild -showsdks | grep -i iphone
+          python3 --version
 
       - name: Install Flutter
         run: |
@@ -62,6 +79,12 @@ jobs:
           echo "$FLUTTER_SHA256  $RUNNER_TEMP/$archive" | shasum -a 256 -c -
           unzip -q "$RUNNER_TEMP/$archive" -d "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      # Runs before the build: embed-engine.sh is an Xcode build phase and only
+      # does its work when app/ios/Engine/.ready exists.
+      - name: Prepare the on-device engine
+        if: ${{ inputs.with_engine }}
+        run: bash tooling/ios/prepare-engine.sh
 
       - name: Resolve dependencies
         run: |
@@ -89,6 +112,21 @@ jobs:
           esac
           mkdir -p "$OUT"
 
+          # A remote-only build must not be mistaken for an engine build (and vice versa).
+          if [ "$WITH_ENGINE" = "true" ]; then
+            PREFIX=dsh-go-engine
+            if [ ! -e "$APP/Frameworks/DshNodeHost.framework" ]; then
+              echo "::error::with_engine=true but DshNodeHost.framework is missing from Runner.app"
+              exit 1
+            fi
+          else
+            PREFIX=dsh-go
+            if [ -e "$APP/Frameworks/DshNodeHost.framework" ]; then
+              echo "::error::with_engine=false but DshNodeHost.framework is present"
+              exit 1
+            fi
+          fi
+
           package() {
             name="$1"; strip="$2"; work="$(mktemp -d)"
             mkdir -p "$work/Payload"
@@ -99,16 +137,18 @@ jobs:
             rm -f "$OUT/$name"
             ( cd "$work" && zip -qry "$OUT/$name" Payload )
             rm -rf "$work"
-            printf '%-30s %10s bytes  sha256=%s\n' "$name" \
+            printf '%-34s %10s bytes  sha256=%s\n' "$name" \
               "$(wc -c <"$OUT/$name" | tr -d ' ')" \
               "$(shasum -a 256 "$OUT/$name" | cut -d' ' -f1)"
           }
 
-          package dsh-go-unsigned.ipa no
-          package dsh-go-unsigned-noshare.ipa yes
+          package "$PREFIX-unsigned.ipa" no
+          package "$PREFIX-unsigned-noshare.ipa" yes
 
           {
             echo '### ipa'
+            echo
+            echo "mode: **$([ "$WITH_ENGINE" = "true" ] && echo 'on-device engine' || echo 'remote only')**"
             echo
             echo '| file | bytes | sha256 |'
             echo '|---|---|---|'
@@ -116,17 +156,23 @@ jobs:
               echo "| $(basename "$f") | $(wc -c <"$f" | tr -d ' ') | $(shasum -a 256 "$f" | cut -d' ' -f1) |"
             done
             echo
-            echo '### remote-only check'
+            echo '### payload check'
             echo
-            for item in Frameworks/DshNodeHost.framework PhoneSelfRunner Frameworks/App.framework; do
-              if [ -e "$APP/$item" ]; then echo "- present: $item"; else echo "- absent: $item"; fi
+            for item in Frameworks/DshNodeHost.framework Frameworks/NodeMobile.framework \
+                        Frameworks/DshFlock.framework Frameworks/DshRequireBuiltin.framework \
+                        dsh-runtime PhoneSelfRunner Frameworks/App.framework; do
+              if [ -e "$APP/Resources/$item" ] || [ -e "$APP/$item" ]; then
+                echo "- present: $item"
+              else
+                echo "- absent: $item"
+              fi
             done
             echo "- Runner.app: $(du -sm "$APP" | cut -f1) MB"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: dsh-go-ipa-unsigned
+          name: dsh-go-ipa-${{ inputs.with_engine && 'engine' || 'remote' }}
           path: dist/*.ipa
           if-no-files-found: error
           retention-days: 30
