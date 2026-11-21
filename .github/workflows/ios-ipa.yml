@@ -36,6 +36,11 @@ on:
         required: false
         default: false
         type: boolean
+      plugins:
+        description: Comma-separated npm packages to bake into the on-device runtime (with_engine only, empty = none)
+        required: false
+        default: billion-context,dsh-whale-widget,dshmarket,dsh-plugin-debugging
+        type: string
 
 permissions:
   contents: read
@@ -126,6 +131,32 @@ jobs:
             echo "::endgroup::"
             exit 1
           fi
+
+      # The phone has no npm: a plugin can only reach 本机 mode if its package is
+      # inside this archive at build time. Installed into a scratch tree and
+      # merged in, so the composed runtime (already patched for iOS) is never
+      # handed to a package manager.
+      - name: Bake plugins into the on-device runtime
+        if: ${{ inputs.with_engine && inputs.plugins != '' }}
+        run: |
+          set -euo pipefail
+          APP="$GITHUB_WORKSPACE/app/build/ios/iphoneos/Runner.app"
+          ZIP="$APP/dsh-runtime/runtime.zip"
+          [ -f "$ZIP" ] || { echo "::error::no dsh-runtime/runtime.zip in the app"; exit 1; }
+          PLUGINS="$(printf '%s' "${{ inputs.plugins }}" | tr ',' ' ')"
+          WORK="$RUNNER_TEMP/plugin-runtime"
+          rm -rf "$WORK"; mkdir -p "$WORK/tree" "$WORK/addons"
+          # The injector lives in the fork (this workflow runs against upstream,
+          # which has no such tool), so it is fetched by name.
+          curl -fsSL -o "$WORK/bundle-plugins.py" \
+            https://raw.githubusercontent.com/Joe-Smith33/dsh-Go/main/ios-toolkit/scripts/bundle-plugins.py
+          ( cd "$WORK/tree" && unzip -q "$ZIP" )
+          ( cd "$WORK/addons" && npm init -y >/dev/null \
+              && npm install --no-audit --no-fund --no-save $PLUGINS )
+          python3 "$WORK/bundle-plugins.py" \
+            "$WORK/tree" "$WORK/addons/node_modules" $PLUGINS
+          cp "$WORK/runtime.zip" "$ZIP"
+          echo "runtime.zip is now $(stat -f%z "$ZIP") bytes"
 
       - name: Upload the build log
         if: always()
