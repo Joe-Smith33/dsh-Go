@@ -36,11 +36,6 @@ on:
         required: false
         default: false
         type: boolean
-      plugins:
-        description: Comma-separated npm packages to bake into the on-device runtime (with_engine only, empty = none)
-        required: false
-        default: billion-context,dsh-whale-widget,dshmarket,dsh-plugin-debugging
-        type: string
 
 permissions:
   contents: read
@@ -91,21 +86,6 @@ jobs:
         if: ${{ inputs.with_engine }}
         run: bash tooling/ios/prepare-engine.sh
 
-      # tooling/ios/ish/build.py needs clang + ld.lld + meson + ninja + patch; the
-      # macOS image only ships clang, so the guest addon build fails without these.
-      # Same recipe and pins as upstream's ios-compile.yml "engine" job.
-      - name: Install the iSH build tools
-        if: ${{ inputs.with_engine }}
-        run: |
-          brew install llvm lld
-          python3 -m venv "$RUNNER_TEMP/ish-tools"
-          "$RUNNER_TEMP/ish-tools/bin/pip" install --quiet meson==1.7.2 ninja==1.11.1.4
-          echo "$RUNNER_TEMP/ish-tools/bin" >> "$GITHUB_PATH"
-          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
-          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/ish-tools/bin/meson" --version
-          "$(brew --prefix lld)/bin/ld.lld" --version
-
       - name: Resolve dependencies
         run: |
           flutter --version
@@ -116,56 +96,7 @@ jobs:
 
       - name: Build for a device, unsigned
         working-directory: app
-        run: |
-          set -o pipefail
-          if bash ../tooling/ios/build.sh --release --no-codesign --verbose > "$RUNNER_TEMP/build.log" 2>&1; then
-            tail -n 15 "$RUNNER_TEMP/build.log"
-          else
-            echo "::error::the device build failed; the full log is the dsh-go-build-log artifact"
-            echo "::group::tail of the build log"
-            tail -n 100 "$RUNNER_TEMP/build.log" || true
-            echo "::endgroup::"
-            echo "::group::lines that look like the cause"
-            grep -inE 'error:|requires a development team|CodeSign|provisioning|PhaseScriptExecution|BUILD FAILED|Undefined symbol' \
-              "$RUNNER_TEMP/build.log" | head -40 || true
-            echo "::endgroup::"
-            exit 1
-          fi
-
-      # The phone has no npm: a plugin can only reach 本机 mode if its package is
-      # inside this archive at build time. Installed into a scratch tree and
-      # merged in, so the composed runtime (already patched for iOS) is never
-      # handed to a package manager.
-      - name: Bake plugins into the on-device runtime
-        if: ${{ inputs.with_engine && inputs.plugins != '' }}
-        run: |
-          set -euo pipefail
-          APP="$GITHUB_WORKSPACE/app/build/ios/iphoneos/Runner.app"
-          ZIP="$APP/dsh-runtime/runtime.zip"
-          [ -f "$ZIP" ] || { echo "::error::no dsh-runtime/runtime.zip in the app"; exit 1; }
-          PLUGINS="$(printf '%s' "${{ inputs.plugins }}" | tr ',' ' ')"
-          WORK="$RUNNER_TEMP/plugin-runtime"
-          rm -rf "$WORK"; mkdir -p "$WORK/tree" "$WORK/addons"
-          # The injector lives in the fork (this workflow runs against upstream,
-          # which has no such tool), so it is fetched by name.
-          curl -fsSL -o "$WORK/bundle-plugins.py" \
-            https://raw.githubusercontent.com/Joe-Smith33/dsh-Go/main/ios-toolkit/scripts/bundle-plugins.py
-          ( cd "$WORK/tree" && unzip -q "$ZIP" )
-          ( cd "$WORK/addons" && npm init -y >/dev/null \
-              && npm install --no-audit --no-fund --no-save $PLUGINS )
-          python3 "$WORK/bundle-plugins.py" \
-            "$WORK/tree" "$WORK/addons/node_modules" $PLUGINS
-          cp "$WORK/runtime.zip" "$ZIP"
-          echo "runtime.zip is now $(stat -f%z "$ZIP") bytes"
-
-      - name: Upload the build log
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: dsh-go-build-log
-          path: ${{ runner.temp }}/build.log
-          if-no-files-found: warn
-          retention-days: 7
+        run: bash ../tooling/ios/build.sh --release --no-codesign
 
       # Packaging is inlined on purpose: no second file has to exist on the
       # upstream branch, and the ipa layout is visible right here.
